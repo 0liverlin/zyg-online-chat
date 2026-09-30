@@ -1,0 +1,2125 @@
+/**
+ * Staff Page - Customer service interface
+ * Responsive design: PC shows sidebar, Mobile uses floating button
+ * With authentication support
+ */
+
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { MessageCircle, Users, User, LogOut, Code2, Settings, ArrowRightLeft, XCircle, ListChecks, Bell, BellOff } from 'lucide-react';
+import { useStaffStore } from '@client/stores/staffStore';
+import { SessionList } from '@client/components/staff/SessionList';
+import { StaffChatWindow, VisitorInfoPanel } from '@client/components/staff/StaffChatWindow';
+import type { VisitorFieldDef } from '@client/components/staff/StaffChatWindow';
+import { QueueList } from '@client/components/staff/QueueList';
+import { StaffManagement } from '@client/components/staff/StaffManagement';
+import { StaffCode } from '@client/components/staff/StaffCode';
+import { StaffSettings } from '@client/components/staff/StaffSettings';
+import { VisitorFields } from '@client/components/staff/VisitorFields';
+import { useAuth } from '@client/hooks/useAuth';
+import { useSiteSettings } from '@client/hooks/useSiteSettings';
+import { useI18n } from '@client/context/I18nContext';
+import {
+  initServiceWorkerForNotification,
+  isNotificationGranted,
+  isNotificationSupported,
+  requestNotificationPermission,
+  setupVisibilityHandler,
+} from '@client/services/notificationService';
+import { initSound, isSoundEnabled, setSoundEnabled } from '@client/utils/notificationSound';
+
+interface UserInfo {
+  userId?: number;
+  username?: string;
+  businessId?: number;
+  businessSlug?: string;
+  businessName?: string;
+  role?: string;
+  roleId?: number | null;
+  permissions?: string[];
+}
+
+// Check if device is mobile
+const isMobileDevice = (): boolean => {
+  if (typeof window === 'undefined') return false;
+  return window.innerWidth <= 768;
+};
+
+// Update URL with session ID
+const updateUrlSessionId = (sessionId: string | null) => {
+  const url = new URL(window.location.href);
+  if (sessionId) {
+    url.searchParams.set('s', sessionId);
+  } else {
+    url.searchParams.delete('s');
+  }
+  window.history.replaceState({}, '', url.toString());
+};
+
+export function StaffPage() {
+  const { t, locale, setLocale, supportedLocales } = useI18n();
+  const { siteName } = useSiteSettings();
+  
+  // Authentication
+  const {
+    isLoading: authLoading,
+    isAuthenticated,
+    requireAuth,
+    error: _authError,
+    remainingAttempts: _remainingAttempts,
+    login: _login,
+  } = useAuth();
+
+  const {
+    sessions,
+    currentSessionId,
+    messages: messagesMap,
+    hasMore: hasMoreMap,
+    loading,
+    messagesLoading,
+    sending,
+    sseConnected,
+    usePolling,
+    totalUnread,
+    error,
+    inputMode,
+    loadSessions,
+    selectSession,
+    loadMoreMessages,
+    sendMessage,
+    uploadFile,
+    markAsRead,
+    initFromUrl,
+    connectSSE,
+    clearError,
+    setInputMode,
+    setUser,
+    updateTopic,
+    clearMessages,
+  } = useStaffStore();
+
+  // UI state for mobile
+  const [isMobile, setIsMobile] = useState(false);
+  const [showSessionList, setShowSessionList] = useState(false);
+  const [showQueueList, setShowQueueList] = useState(false);
+  const [showUserMenu, setShowUserMenu] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [showEndSessionConfirm, setShowEndSessionConfirm] = useState(false);
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const [userInfo, setUserInfo] = useState<UserInfo | null>(null);
+  const [currentPage, setCurrentPage] = useState<'home' | 'staff' | 'code' | 'settings' | 'visitorFields'>('home');
+  const [staffList, setStaffList] = useState<{ id: number; name: string; username: string }[]>([]);
+  const [visitorFieldDefs, setVisitorFieldDefs] = useState<VisitorFieldDef[]>([]);
+  const [profileForm, setProfileForm] = useState({
+    name: '',
+    password: '',
+    confirmPassword: '',
+  });
+  const [profileMessage, setProfileMessage] = useState('');
+  
+  // Statistics data
+  const [stats, setStats] = useState<{
+    todaySessions: number;
+    activeSessions: number;
+    queueCount: number;
+    avgResponseTime: number;
+    satisfactionRate: number;
+    evaluationCount: number;
+    todayMessages: number;
+  } | null>(null);
+  const [statsLoading, setStatsLoading] = useState(true);
+
+  // Ref to prevent multiple initializations
+  const dataLoadedRef = useRef(false);
+
+  // Transfer request state
+  const [pendingTransfers, setPendingTransfers] = useState<any[]>([]);
+  const [showTransferNotification, setShowTransferNotification] = useState(false);
+  const transferPollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Rejected transfers notification state
+  const [rejectedTransfers, setRejectedTransfers] = useState<any[]>([]);
+  const [showRejectionNotification, setShowRejectionNotification] = useState(false);
+  const rejectionPollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Re-apply transfer state
+  const [selectedReapplyRequest, setSelectedReapplyRequest] = useState<any | null>(null);
+  const [reapplyReason, setReapplyReason] = useState('');
+  
+  // Reject modal state
+  const [selectedRejectRequest, setSelectedRejectRequest] = useState<any | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+
+  // ★ 提示音开关状态
+  const [soundOn, setSoundOn] = useState(isSoundEnabled());
+  /** 切换提示音 */
+  const handleToggleSound = () => {
+    const next = !soundOn;
+    setSoundOn(next);
+    setSoundEnabled(next);
+  };
+
+  // ★ 通知权限横幅状态（授权后自动隐藏）
+  const [showPermBanner, setShowPermBanner] = useState(
+    isNotificationSupported() && !isNotificationGranted()
+  );
+  const handleEnableNotification = async () => {
+    const result = await requestNotificationPermission().catch(() => 'denied' as const);
+    if (result === 'granted') {
+      setShowPermBanner(false);
+    }
+  };
+
+  // ============ ALL HOOKS MUST BE BEFORE CONDITIONAL RETURNS ============
+
+  // 定时刷新在线状态：每30秒强制重新渲染以保证绿点时效性
+  const [, setStatusTick] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => setStatusTick((t) => t + 1), 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ★ 初始化音频和推送通知服务（登录后执行）
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    let visibilityCleanup: (() => void) | undefined;
+
+    const init = async () => {
+      await initSound();
+      await initServiceWorkerForNotification();
+      visibilityCleanup = setupVisibilityHandler();
+    };
+    init();
+
+    // ★ 延迟 3 秒后请求通知权限
+    const timer = setTimeout(() => {
+      if (isNotificationSupported() && !isNotificationGranted()) {
+        requestNotificationPermission().catch(() => {});
+      }
+    }, 3000);
+
+    return () => {
+      clearTimeout(timer);
+      visibilityCleanup?.();
+    };
+  }, [isAuthenticated]);
+
+  // ★ 页面获得焦点时：通知点击导航 → 重新初始化URL会话 + 自动标记已读
+  useEffect(() => {
+    const handleFocus = () => {
+      // ★ SW 导航后 URL 中的 sessionId 可能与当前不同，需要重新匹配
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlSessionId = urlParams.get('s');
+      if (urlSessionId && urlSessionId !== currentSessionId) {
+        console.log('[StaffPage] Focus: URL session changed, re-initializing from URL', urlSessionId);
+        initFromUrl();
+        return;
+      }
+
+      // 同一会话 → 自动标记已读
+      if (currentSessionId && totalUnread > 0) {
+        markAsRead(currentSessionId);
+      }
+    };
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [currentSessionId, totalUnread, markAsRead, initFromUrl]);
+
+  // ★ Service Worker postMessage 降级：当 SW 无法 navigate 时，通过消息通知页面自行导航
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'NOTIFICATION_NAVIGATE' && event.data?.url) {
+        const targetUrl = event.data.url as string;
+        console.log('[StaffPage] SW postMessage: navigating to', targetUrl);
+        // 直接用 window.location.href 跳转，触发 React Router 重新渲染
+        window.location.href = targetUrl;
+      }
+    };
+    navigator.serviceWorker.addEventListener('message', handleMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', handleMessage);
+  }, []);
+  useEffect(() => {
+    const checkMobile = () => {
+      setIsMobile(isMobileDevice());
+    };
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  // Handle redirect to login when not authenticated
+  useEffect(() => {
+    if (requireAuth && !isAuthenticated && !authLoading) {
+      // Use replace to prevent going back to staff page after logout
+      window.location.replace('/stafflogin');
+    }
+  }, [requireAuth, isAuthenticated, authLoading]);
+
+  // Load sessions, connect SSE and check URL params only after authentication
+  useEffect(() => {
+    // Only load data when authenticated and not already loaded
+    if (!isAuthenticated || dataLoadedRef.current) return;
+
+    // Mark as loaded to prevent re-initialization
+    dataLoadedRef.current = true;
+
+    // Initialize data
+    loadSessions();
+    connectSSE();
+    initFromUrl();
+    
+    // Fetch visitor field definitions for custom param display labels
+    fetchVisitorFieldDefs();
+    
+    // Start polling for pending transfer requests
+    fetchPendingTransfers();
+    transferPollingIntervalRef.current = setInterval(fetchPendingTransfers, 10000);
+    
+    // Start polling for rejected transfers (notifications)
+    fetchRejectedTransfers();
+    rejectionPollingIntervalRef.current = setInterval(fetchRejectedTransfers, 15000);
+    
+    return () => {
+      if (transferPollingIntervalRef.current) {
+        clearInterval(transferPollingIntervalRef.current);
+      }
+      if (rejectionPollingIntervalRef.current) {
+        clearInterval(rejectionPollingIntervalRef.current);
+      }
+    };
+  }, [isAuthenticated, loadSessions, connectSSE, initFromUrl]);
+
+  // Get user info after authentication
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    const fetchUserInfo = async () => {
+      try {
+        const response = await fetch('/api/auth/verify', {
+          headers: {
+            Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+          },
+        });
+        const result = await response.json();
+        if (result.success && result.valid) {
+          setUserInfo({
+            userId: result.userId,
+            username: result.username || t('administrator'),
+            businessId: result.businessId,
+            businessSlug: result.businessSlug,
+            businessName: result.businessName,
+            role: result.role,
+            roleId: result.roleId,
+            permissions: result.permissions || [],
+          });
+          setUser({
+            userId: result.userId,
+            username: result.username || t('administrator'),
+            businessId: result.businessId,
+            role: result.role,
+          });
+        }
+      } catch (error) {
+        console.error('Failed to fetch user info:', error);
+      }
+    };
+
+    fetchUserInfo();
+    fetchStats();
+    fetchStaffList();
+  }, [isAuthenticated]);
+
+  const fetchStaffList = async () => {
+    try {
+      const response = await fetch('/api/staff/users', {
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+        },
+      });
+      const result = await response.json();
+      if (result.success) {
+        const staffUsers = result.data.map((user: any) => ({
+          id: user.id,
+          name: user.name || user.username,
+          username: user.username,
+        }));
+        console.log('Fetched staff list:', staffUsers);
+        setStaffList(staffUsers);
+      }
+    } catch (error) {
+      console.error('Failed to fetch staff list:', error);
+    }
+  };
+
+  const fetchVisitorFieldDefs = async () => {
+    try {
+      const response = await fetch('/api/staff/visitor-fields', {
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+        },
+      });
+      const result = await response.json();
+      if (result.success) {
+        // 合并固定字段和自定义字段定义，全部参与动态渲染
+        // 固定字段的 label 通过 i18n 翻译，不再使用服务器返回的中文原文
+        const fixedDefs: VisitorFieldDef[] = (result.data.fixedFields || []).map((f: any) => ({
+          fieldKey: f.fieldKey,
+          label: t(`fixed_field_${f.fieldKey}` as any),
+          type: f.type,
+          isFixed: true,
+        }));
+        const customDefs: VisitorFieldDef[] = (result.data.customFields || []).map((f: any) => ({
+          fieldKey: f.fieldKey,
+          label: f.label,
+          type: f.type,
+          isFixed: false,
+        }));
+        setVisitorFieldDefs([...fixedDefs, ...customDefs]);
+      }
+    } catch (error) {
+      console.error('Failed to fetch visitor field definitions:', error);
+    }
+  };
+
+  const fetchStats = async () => {
+    setStatsLoading(true);
+    try {
+      const response = await fetch('/api/chat/stats', {
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+        },
+      });
+      const result = await response.json();
+      if (result.success) {
+        setStats(result.data);
+      }
+    } catch (error) {
+      console.error('Failed to fetch stats:', error);
+    } finally {
+      setStatsLoading(false);
+    }
+  };
+
+  const fetchPendingTransfers = async () => {
+    try {
+      const response = await fetch('/api/chat/transfer/pending', {
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+        },
+      });
+      const result = await response.json();
+      if (result.success && result.data) {
+        const newCount = result.data.length;
+        const oldCount = pendingTransfers.length;
+        
+        setPendingTransfers(result.data);
+        
+        // Show notification if there are new transfer requests
+        if (newCount > oldCount && newCount > 0) {
+          setShowTransferNotification(true);
+          // Auto hide after 5 seconds
+          setTimeout(() => {
+            setShowTransferNotification(false);
+          }, 5000);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to fetch pending transfers:', error);
+    }
+  };
+
+  const fetchRejectedTransfers = async () => {
+    try {
+      const response = await fetch('/api/chat/transfer/my', {
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+        },
+      });
+      const result = await response.json();
+      if (result.success && result.data) {
+        // Filter only rejected requests with reject_reason
+        const rejected = result.data.filter((req: any) => 
+          req.status === 'rejected' && req.reject_reason
+        );
+        
+        const oldCount = rejectedTransfers.length;
+        const newCount = rejected.length;
+        
+        setRejectedTransfers(rejected);
+        
+        // Show notification if there are new rejections
+        if (newCount > oldCount && newCount > 0) {
+          setShowRejectionNotification(true);
+          // Auto hide after 10 seconds
+          setTimeout(() => {
+            setShowRejectionNotification(false);
+          }, 10000);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to fetch rejected transfers:', error);
+    }
+  };
+
+  const handleCancelRejection = async (requestId: number) => {
+    try {
+      const response = await fetch(`/api/chat/transfer/${requestId}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+        },
+      });
+      const result = await response.json();
+      if (result.success) {
+        // Remove from local state
+        setRejectedTransfers(prev => prev.filter(req => req.id !== requestId));
+        // If no more rejected transfers, hide notification
+        if (rejectedTransfers.length <= 1) {
+          setShowRejectionNotification(false);
+        }
+      } else {
+        alert(result.error || t('delete_failed'));
+      }
+    } catch (error) {
+      console.error('Failed to cancel rejection:', error);
+      alert(t('delete_failed'));
+    }
+  };
+
+  const handleReapplyTransfer = async () => {
+    if (!selectedReapplyRequest) return;
+    
+    if (!reapplyReason.trim()) {
+      alert(t('please_fill_transfer_reason'));
+      return;
+    }
+
+    try {
+      // Create a new transfer request
+      const response = await fetch('/api/chat/transfer/request', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+        },
+        body: JSON.stringify({
+          sessionId: selectedReapplyRequest.session_id,
+          toStaffId: selectedReapplyRequest.to_staff_id,
+          reason: reapplyReason,
+        }),
+      });
+      const result = await response.json();
+      if (result.success) {
+        // Delete the old rejected request
+        await fetch(`/api/chat/transfer/${selectedReapplyRequest.id}`, {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+          },
+        });
+        
+        // Update local state
+        setRejectedTransfers(prev => prev.filter(req => req.id !== selectedReapplyRequest.id));
+        setSelectedReapplyRequest(null);
+        setReapplyReason('');
+        
+        // If no more rejected transfers, hide notification
+        if (rejectedTransfers.length <= 1) {
+          setShowRejectionNotification(false);
+        }
+        
+        alert(t('transfer_request_resent'));
+      } else {
+        alert(result.error || t('resend_failed'));
+      }
+    } catch (error) {
+      console.error('Failed to reapply transfer:', error);
+      alert(t('resend_failed'));
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('staff_token');
+    localStorage.removeItem('staff_token_expires');
+    window.location.reload();
+  };
+
+  const handleAcceptTransfer = async (requestId: number) => {
+    try {
+      const response = await fetch(`/api/chat/transfer/${requestId}/respond`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+        },
+        body: JSON.stringify({ action: 'accept' }),
+      });
+      const result = await response.json();
+      if (result.success) {
+        // Refresh pending transfers list
+        await fetchPendingTransfers();
+        // Reload sessions to show the new session
+        await loadSessions();
+        alert(t('transfer_accepted'));
+      } else {
+        alert(result.error || t('accept_failed'));
+      }
+    } catch (error) {
+      console.error('Failed to accept transfer:', error);
+      alert(t('accept_failed'));
+    }
+  };
+
+  const handleRejectTransfer = async () => {
+    if (!selectedRejectRequest) return;
+    
+    if (!rejectReason.trim()) {
+      alert(t('please_fill_reject_reason'));
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/chat/transfer/${selectedRejectRequest.id}/respond`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+        },
+        body: JSON.stringify({ action: 'reject', reason: rejectReason }),
+      });
+      const result = await response.json();
+      if (result.success) {
+        // Refresh pending transfers list
+        await fetchPendingTransfers();
+        // Close modal and clear form
+        setSelectedRejectRequest(null);
+        setRejectReason('');
+        setShowTransferNotification(false);
+      } else {
+        alert(result.error || t('reject_failed'));
+      }
+    } catch (error) {
+      console.error('Failed to reject transfer:', error);
+      alert(t('reject_failed'));
+    }
+  };
+
+  const handleOpenProfile = () => {
+    setShowProfileModal(true);
+    setShowUserMenu(false);
+    setProfileForm({ name: '', password: '', confirmPassword: '' });
+    setProfileMessage('');
+  };
+
+  const handleCloseProfile = () => {
+    setShowProfileModal(false);
+    setProfileForm({ name: '', password: '', confirmPassword: '' });
+    setProfileMessage('');
+  };
+
+  const handleUpdateProfile = async () => {
+    setProfileMessage('');
+    
+    if (profileForm.password !== profileForm.confirmPassword) {
+      setProfileMessage(t('password_mismatch'));
+      return;
+    }
+
+    if (!profileForm.name && !profileForm.password) {
+      setProfileMessage(t('please_modify_at_least_one'));
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem('staff_token');
+      const response = await fetch('/api/staff/profile', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          name: profileForm.name || undefined,
+          password: profileForm.password || undefined,
+        }),
+      });
+
+      const result = await response.json();
+      if (result.success) {
+        setProfileMessage(t('modify_success'));
+        setTimeout(() => {
+          handleCloseProfile();
+        }, 1500);
+      } else {
+        setProfileMessage(result.error || t('modify_failed'));
+      }
+    } catch (error) {
+      setProfileMessage(t('modify_failed'));
+    }
+  };
+
+  const handleClearMessages = () => {
+    if (currentSessionId) {
+      clearMessages(currentSessionId);
+      setShowClearConfirm(false);
+    }
+  };
+
+  const handleEndSession = async () => {
+    if (currentSessionId) {
+      try {
+        const response = await fetch(`/api/staff/sessions/${currentSessionId}/end`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+          },
+        });
+        const result = await response.json();
+        if (result.success) {
+          // Refresh sessions list to remove the closed session
+          await loadSessions();
+          console.log('Session ended successfully');
+        } else {
+          console.error('Failed to end session:', result.error);
+        }
+      } catch (error) {
+        console.error('Failed to end session:', error);
+      }
+      setShowEndSessionConfirm(false);
+    }
+  };
+
+  // Get current session info
+  const currentSession = sessions.find((s) => s.id === currentSessionId) || null;
+  const currentMessages = currentSessionId ? messagesMap.get(currentSessionId) || [] : [];
+  const currentHasMore = currentSessionId ? hasMoreMap.get(currentSessionId) || false : false;
+
+  const handleSelectSession = useCallback((sessionId: string) => {
+    selectSession(sessionId);
+    markAsRead(sessionId);
+    // Update URL with session ID
+    updateUrlSessionId(sessionId);
+    // Close session list on mobile after selection
+    if (isMobile) {
+      setShowSessionList(false);
+    }
+  }, [selectSession, markAsRead, isMobile]);
+
+  const handleSend = (content: string, type: 'text' | 'image' | 'video' | 'file') => {
+    // 如果是主题模式，更新主题而不是发送消息
+    if (inputMode === 'topic' && currentSessionId) {
+      updateTopic(currentSessionId, content);
+      setInputMode('chat'); // 更新后切回聊天模式
+    } else {
+      sendMessage(content, type);
+    }
+  };
+
+  const handleUpload = (file: File) => {
+    uploadFile(file);
+  };
+
+  // Manual translation callback for staff: update message in store
+  const handleTranslated = useCallback((messageId: number, translatedContent: string, translateEngine?: string) => {
+    const store = useStaffStore;
+    const state = store.getState();
+    const messagesMap = new Map(state.messages);
+    const sessionMessages = messagesMap.get(currentSessionId || '');
+    if (sessionMessages) {
+      messagesMap.set(
+        currentSessionId!,
+        sessionMessages.map((m) => (m.id === messageId ? { ...m, translatedContent, translateEngine } : m))
+      );
+      store.setState({ messages: messagesMap });
+    }
+  }, [currentSessionId]);
+
+  const handleTopicChange = (topic: string) => {
+    if (currentSessionId) {
+      updateTopic(currentSessionId, topic);
+    }
+  };
+
+  const toggleSessionList = () => {
+    setShowSessionList((prev) => !prev);
+  };
+
+  // ============ CONDITIONAL RETURNS AFTER ALL HOOKS ============
+
+  // Show loading state while checking authentication
+  if (authLoading) {
+    return (
+      <div style={{
+        height: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: '#f5f5f5',
+      }}>
+        <div style={{ textAlign: 'center' }}>
+          <div className="animate-spin" style={{
+            width: '40px',
+            height: '40px',
+            border: '3px solid #e5e7eb',
+            borderTopColor: '#3b82f6',
+            borderRadius: '50%',
+            margin: '0 auto 16px',
+          }}></div>
+          <p style={{ color: '#6b7280' }}>{t('loading')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ============ STYLES (only used when authenticated) ============
+
+  const pageStyle: React.CSSProperties = {
+    height: '100%',
+    display: 'flex',
+    flexDirection: 'column',
+    backgroundColor: '#f5f5f5',
+    overflow: 'hidden',
+  };
+
+  const headerStyle: React.CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: isMobile ? '12px 16px' : '12px 24px',
+    backgroundColor: '#001529',
+    color: '#fff',
+    flexShrink: 0,
+  };
+
+  const mainStyle: React.CSSProperties = {
+    flex: 1,
+    display: 'flex',
+    overflow: 'hidden',
+    position: 'relative',
+  };
+
+  const sidebarStyle: React.CSSProperties = isMobile ? {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    width: '85%',
+    maxWidth: '320px',
+    zIndex: 100,
+    transform: showSessionList ? 'translateX(0)' : 'translateX(-100%)',
+    transition: 'transform 0.3s ease',
+    boxShadow: showSessionList ? '2px 0 8px rgba(0,0,0,0.15)' : 'none',
+    display: 'flex',
+    flexDirection: 'column',
+    overflow: 'hidden',
+    backgroundColor: '#fafbfc',
+    borderRight: '1px solid #e8ecf1',
+  } : {
+    width: '320px',
+    flexShrink: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    overflow: 'hidden',
+    backgroundColor: '#fafbfc',
+    borderRight: '1px solid #e8ecf1',
+  };
+
+  const contentStyle: React.CSSProperties = {
+    flex: 1,
+    overflow: 'hidden',
+  };
+
+  const visitorPanelStyle: React.CSSProperties = {
+    width: '280px',
+    flexShrink: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    backgroundColor: '#fff',
+    borderLeft: '1px solid #e8e8e8',
+    overflow: 'hidden',
+  };
+
+  const statusStyle: React.CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    gap: isMobile ? '8px' : '16px',
+    fontSize: '14px',
+  };
+
+  const statusItemStyle: React.CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+  };
+
+  const dotStyle = (connected: boolean, polling?: boolean): React.CSSProperties => ({
+    width: '8px',
+    height: '8px',
+    borderRadius: '50%',
+    // SSE连接成功 → 绿色；Polling后备连接正常 → 绿色；都未连接 → 红色
+    backgroundColor: (connected || polling) ? '#52c41a' : '#ff4d4f',
+  });
+
+  const getStatusText = () => {
+    if (sseConnected) return t('service_online');
+    if (usePolling) return t('polling');
+    return t('connecting');
+  };
+
+  const errorStyle: React.CSSProperties = {
+    position: 'fixed',
+    top: '16px',
+    left: '50%',
+    transform: 'translateX(-50%)',
+    backgroundColor: '#ff4d4f',
+    color: '#fff',
+    padding: '10px 20px',
+    borderRadius: '8px',
+    zIndex: 1001,
+    display: 'flex',
+    alignItems: 'center',
+    gap: '12px',
+  };
+
+  const floatingButtonStyle: React.CSSProperties = {
+    position: 'fixed',
+    left: '16px',
+    bottom: '90px',
+    width: '56px',
+    height: '56px',
+    borderRadius: '50%',
+    backgroundColor: '#1890ff',
+    color: '#fff',
+    border: 'none',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '24px',
+    zIndex: 99,
+    transition: 'transform 0.2s ease',
+  };
+
+  const overlayStyle: React.CSSProperties = {
+    position: 'absolute',
+    inset: 0,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    zIndex: 50,
+    display: showSessionList ? 'block' : 'none',
+  };
+
+  // Navigation tabs style
+  const navTabStyle: React.CSSProperties = {
+    display: 'flex',
+    flexWrap: 'nowrap',
+    overflowX: 'auto',
+    borderBottom: '1px solid #e8e8e8',
+    backgroundColor: '#fff',
+    scrollbarWidth: 'thin',
+  };
+
+  const navTabItemStyle = (active: boolean): React.CSSProperties => ({
+    padding: '12px 20px',
+    borderBottom: active ? '2px solid #1890ff' : '2px solid transparent',
+    backgroundColor: active ? '#f0f5ff' : 'transparent',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    fontSize: '14px',
+    color: active ? '#1890ff' : '#666',
+    fontWeight: active ? 500 : 400,
+    transition: 'all 0.2s',
+    whiteSpace: 'nowrap',
+    flexShrink: 0,
+  });
+
+  // ============ MAIN RENDER ============
+
+  return (
+    <div style={pageStyle}>
+      {/* Header */}
+      <div style={headerStyle}>
+        <div style={{ fontSize: '18px', fontWeight: 500 }}>
+          {siteName || t('service_title')}
+        </div>
+        <div style={statusStyle}>
+          {/* Queue button */}
+          <button
+            onClick={() => setShowQueueList(true)}
+            style={{
+              padding: '6px 12px',
+              backgroundColor: 'transparent',
+              border: '1px solid rgba(255,255,255,0.3)',
+              borderRadius: '16px',
+              color: '#fff',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '4px',
+              fontSize: '13px',
+            }}
+            title={t('view_task_queue')}
+          >
+            <Users size={14} />
+            <span style={{ display: isMobile ? 'none' : 'inline' }}>{t('queue')}</span>
+          </button>
+          <div style={statusItemStyle}>
+            <span style={dotStyle(sseConnected, usePolling)}></span>
+            <span style={{ display: isMobile ? 'none' : 'inline' }}>
+              {getStatusText()}
+            </span>
+          </div>
+          {totalUnread > 0 && (
+            <div style={statusItemStyle}>
+              <span
+                style={{
+                  backgroundColor: '#ff4d4f',
+                  padding: '2px 8px',
+                  borderRadius: '10px',
+                  fontSize: '12px',
+                }}
+              >
+                {totalUnread}
+              </span>
+            </div>
+          )}
+          {/* Transfer request notification badge */}
+          {pendingTransfers.length > 0 && (
+            <button
+              onClick={() => setShowTransferNotification(!showTransferNotification)}
+              style={{
+                padding: '6px 12px',
+                backgroundColor: '#faad14',
+                border: 'none',
+                borderRadius: '16px',
+                color: '#fff',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+                fontSize: '13px',
+                fontWeight: 500,
+              }}
+              title={t('pending_transfer_requests')}
+            >
+              <ArrowRightLeft size={14} />
+              <span>{pendingTransfers.length}</span>
+            </button>
+          )}
+          {/* Language Selector */}
+          <select
+            value={locale}
+            onChange={async (e) => {
+              const newLocale = e.target.value as any;
+              // 同步保存语言偏好到数据库（用于自动翻译目标语言）
+              try {
+                const langMap: Record<string, string> = {
+                  'zh-CN': 'zh-CN', 'en-US': 'en', 'jp': 'ja', 'kr': 'ko',
+                  'es': 'es', 'fr': 'fr', 'it': 'it', 'de': 'de', 'pt': 'pt',
+                  'vi': 'vi', 'ru': 'ru', 'id': 'id', 'th': 'th', 'ar': 'ar',
+                  'el': 'el', 'pl': 'pl', 'da': 'da', 'nl': 'nl', 'fi': 'fi',
+                  'tc': 'zh-CN',
+                };
+                const defaultLang = langMap[newLocale] || newLocale;
+                await fetch('/api/staff/language', {
+                  method: 'PUT',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${localStorage.getItem('staff_token')}`,
+                  },
+                  body: JSON.stringify({ lang: defaultLang }),
+                });
+              } catch (err) {
+                console.error('Failed to save language preference:', err);
+              }
+              setLocale(newLocale);
+            }}
+            style={{
+              padding: '4px 8px',
+              borderRadius: '4px',
+              border: '1px solid rgba(255,255,255,0.3)',
+              backgroundColor: 'rgba(255,255,255,0.1)',
+              color: '#fff',
+              fontSize: '13px',
+              cursor: 'pointer',
+            }}
+          >
+            {supportedLocales.map((l) => (
+              <option key={l.code} value={l.code} style={{ color: '#000' }}>
+                {l.nativeName}
+              </option>
+            ))}
+          </select>
+          {/* Sound toggle */}
+          <button
+            onClick={handleToggleSound}
+            style={{
+              padding: '6px 8px',
+              backgroundColor: 'transparent',
+              border: '1px solid rgba(255,255,255,0.3)',
+              borderRadius: '16px',
+              color: '#fff',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: '14px',
+            }}
+            title={soundOn ? t('close_wav') : t('open_wav')}
+          >
+            {soundOn ? <Bell size={14} /> : <BellOff size={14} />}
+          </button>
+          {/* User menu */}
+          <div style={{ position: 'relative' }}>
+            <button
+              onClick={() => setShowUserMenu(!showUserMenu)}
+              style={{
+                padding: '6px 12px',
+                backgroundColor: 'transparent',
+                border: '1px solid rgba(255,255,255,0.3)',
+                borderRadius: '16px',
+                color: '#fff',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                fontSize: '13px',
+              }}
+            >
+              <User size={14} />
+              <span>{userInfo?.username || t('login')}</span>
+            </button>
+            {showUserMenu && (
+              <div
+                style={{
+                  position: 'absolute',
+                  right: 0,
+                  top: '100%',
+                  marginTop: '8px',
+                  backgroundColor: '#fff',
+                  borderRadius: '8px',
+                  boxShadow: '0 2px 12px rgba(0,0,0,0.15)',
+                  padding: '8px',
+                  minWidth: '150px',
+                  zIndex: 200,
+                }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <button
+                  onClick={handleOpenProfile}
+                  style={{
+                    width: '100%',
+                    padding: '8px 12px',
+                    backgroundColor: 'transparent',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    color: '#666',
+                    fontSize: '13px',
+                    textAlign: 'left',
+                  }}
+                >
+                  <User size={14} />
+                  {t('staff_nav_profile')}
+                </button>
+                <button
+                  onClick={handleLogout}
+                  style={{
+                    width: '100%',
+                    padding: '8px 12px',
+                    backgroundColor: 'transparent',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    color: '#666',
+                    fontSize: '13px',
+                    textAlign: 'left',
+                  }}
+                >
+                  <LogOut size={14} />
+                  {t('logout')}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* ★ 通知权限引导横幅 */}
+      {showPermBanner && (
+        <div style={{
+          backgroundColor: '#fff7e6',
+          borderBottom: '1px solid #ffd591',
+          padding: '10px 24px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '12px',
+        }}>
+          <span style={{ fontSize: '13px', color: '#ad6800', flex: 1 }}>
+            ⚠️ {t('notification_permission_banner')}
+          </span>
+          <button
+            onClick={handleEnableNotification}
+            style={{
+              padding: '5px 16px',
+              backgroundColor: '#faad14',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '13px',
+              fontWeight: 500,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {t('notification_enable')}
+          </button>
+        </div>
+      )}
+
+      {/* Navigation Tabs */}
+      <div style={navTabStyle}>
+        <div
+          onClick={() => setCurrentPage('home')}
+          style={navTabItemStyle(currentPage === 'home')}
+        >
+          <MessageCircle size={16} />
+          <span>{t('staff_nav_home')}</span>
+        </div>
+        {((userInfo?.permissions?.includes('staff_view') || userInfo?.permissions?.includes('staff_edit')) || userInfo?.role === 'admin') && (
+          <div
+            onClick={() => setCurrentPage('staff')}
+            style={navTabItemStyle(currentPage === 'staff')}
+          >
+            <Users size={16} />
+            <span>{t('staff_nav_management')}</span>
+          </div>
+        )}
+        {(userInfo?.permissions?.includes('settings') || userInfo?.role === 'admin') && (
+          <div
+            onClick={() => setCurrentPage('visitorFields')}
+            style={navTabItemStyle(currentPage === 'visitorFields')}
+          >
+            <ListChecks size={16} />
+            <span>{t('staff_nav_visitor_fields')}</span>
+          </div>
+        )}
+        <div
+          onClick={() => setCurrentPage('code')}
+          style={navTabItemStyle(currentPage === 'code')}
+        >
+          <Code2 size={16} />
+          <span>{t('staff_nav_code')}</span>
+        </div>
+        {(userInfo?.permissions?.includes('settings') || userInfo?.role === 'admin') && (
+          <div
+            onClick={() => setCurrentPage('settings')}
+            style={navTabItemStyle(currentPage === 'settings')}
+          >
+            <Settings size={16} />
+            <span>{t('staff_nav_settings')}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Clear messages confirmation modal */}
+      {showClearConfirm && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0,0,0,0.5)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onClick={() => setShowClearConfirm(false)}
+        >
+          <div
+            style={{
+              backgroundColor: '#fff',
+              borderRadius: '12px',
+              padding: '24px',
+              minWidth: '320px',
+              maxWidth: '400px',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ margin: '0 0 12px 0', fontSize: '16px', fontWeight: 500 }}>
+              {t('clear_messages')}
+            </h3>
+            <p style={{ margin: '0 0 20px 0', fontSize: '14px', color: '#666' }}>
+              {t('confirm_clear')}
+            </p>
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setShowClearConfirm(false)}
+                style={{
+                  padding: '8px 16px',
+                  border: '1px solid #d9d9d9',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  backgroundColor: '#fff',
+                  color: '#666',
+                  fontSize: '14px',
+                }}
+              >
+                {t('cancel')}
+              </button>
+              <button
+                onClick={handleClearMessages}
+                style={{
+                  padding: '8px 16px',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  backgroundColor: '#ff4d4f',
+                  color: '#fff',
+                  fontSize: '14px',
+                }}
+              >
+                {t('confirm_clear')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* End session confirmation modal */}
+      {showEndSessionConfirm && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0,0,0,0.5)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onClick={() => setShowEndSessionConfirm(false)}
+        >
+          <div
+            style={{
+              backgroundColor: '#fff',
+              borderRadius: '12px',
+              padding: '24px',
+              minWidth: '320px',
+              maxWidth: '400px',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ margin: '0 0 12px 0', fontSize: '16px', fontWeight: 500 }}>
+              {t('end_session')}
+            </h3>
+            <p style={{ margin: '0 0 20px 0', fontSize: '14px', color: '#666' }}>
+              {t('confirm_end_session')}
+            </p>
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setShowEndSessionConfirm(false)}
+                style={{
+                  padding: '8px 16px',
+                  border: '1px solid #d9d9d9',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  backgroundColor: '#fff',
+                  color: '#666',
+                  fontSize: '14px',
+                }}
+              >
+                {t('cancel')}
+              </button>
+              <button
+                onClick={handleEndSession}
+                style={{
+                  padding: '8px 16px',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  backgroundColor: '#ff4d4f',
+                  color: '#fff',
+                  fontSize: '14px',
+                }}
+              >
+                {t('confirm')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Error toast */}
+      {error && (
+        <div style={errorStyle}>
+          <span>{error}</span>
+          <button
+            onClick={clearError}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              color: '#fff',
+              cursor: 'pointer',
+              fontSize: '16px',
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Main content */}
+      <div style={mainStyle}>
+        {/* Home page - Chat interface */}
+        {currentPage === 'home' && (
+          <>
+            {/* Overlay (mobile only) */}
+            {isMobile && (
+              <div style={overlayStyle} onClick={() => setShowSessionList(false)} />
+            )}
+
+            {/* Sidebar - Statistics and Session List */}
+            <div style={sidebarStyle}>
+              {/* Statistics Cards */}
+              {currentPage === 'home' && (
+                <div style={{ padding: '12px', borderBottom: '1px solid #e8e8e8', backgroundColor: '#fff', flexShrink: 0 }}>
+                  <div style={{ fontSize: '13px', fontWeight: 500, color: '#666', marginBottom: '12px', paddingLeft: '4px' }}>
+                    {t('staff_stats_overview')}
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                    <div style={{ backgroundColor: '#f6ffed', padding: '8px', borderRadius: '6px' }}>
+                      <div style={{ fontSize: '18px', fontWeight: 600, color: '#52c41a' }}>
+                        {statsLoading ? '...' : stats?.todaySessions || 0}
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#8c8c8c' }}>{t('staff_stats_today_sessions')}</div>
+                    </div>
+                    <div style={{ backgroundColor: '#fff7e6', padding: '8px', borderRadius: '6px' }}>
+                      <div style={{ fontSize: '18px', fontWeight: 600, color: '#fa8c16' }}>
+                        {statsLoading ? '...' : stats?.activeSessions || 0}
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#8c8c8c' }}>{t('staff_stats_active_sessions')}</div>
+                    </div>
+                    <div style={{ backgroundColor: '#fff1f0', padding: '8px', borderRadius: '6px' }}>
+                      <div style={{ fontSize: '18px', fontWeight: 600, color: '#ff4d4f' }}>
+                        {statsLoading ? '...' : stats?.queueCount || 0}
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#8c8c8c' }}>{t('staff_stats_queue_count')}</div>
+                    </div>
+                    <div style={{ backgroundColor: '#e6f7ff', padding: '8px', borderRadius: '6px' }}>
+                      <div style={{ fontSize: '18px', fontWeight: 600, color: '#1890ff' }}>
+                        {statsLoading ? '...' : stats?.todayMessages || 0}
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#8c8c8c' }}>{t('staff_stats_today_messages')}</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+              <SessionList
+                sessions={sessions}
+                currentSessionId={currentSessionId}
+                onSelect={handleSelectSession}
+                loading={loading}
+                staffList={staffList}
+                t={t as any}
+              />
+            </div>
+
+            {/* Chat Window */}
+            <div style={contentStyle}>
+              <StaffChatWindow
+                session={currentSession}
+                messages={currentMessages}
+                hasMore={currentHasMore}
+                loading={messagesLoading}
+                sending={sending}
+                inputMode={inputMode}
+                isMobile={isMobile}
+                onLoadMore={loadMoreMessages}
+                onSend={handleSend}
+                onUpload={handleUpload}
+                onModeChange={setInputMode}
+                onTopicChange={handleTopicChange}
+                onClearMessages={() => setShowClearConfirm(true)}
+                onEndSession={() => setShowEndSessionConfirm(true)}
+                onTransfer={() => {}}
+                currentStaffId={userInfo?.userId}
+                staffList={staffList}
+                t={t as any}
+                showTranslate={true}
+                translateLang={locale}
+                onTranslated={handleTranslated}
+              />
+            </div>
+
+            {/* 右侧访客信息侧边栏 */}
+            {currentSession && !isMobile && (
+              <div style={visitorPanelStyle}>
+                <div style={{
+                  padding: '14px',
+                  backgroundColor: '#fafafa',
+                  borderBottom: '1px solid #e8e8e8',
+                }}>
+                  <div style={{
+                    fontSize: '14px',
+                    fontWeight: 600,
+                    color: '#333',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                  }}>
+                    <span style={{
+                      display: 'inline-block',
+                      width: '8px',
+                      height: '8px',
+                      borderRadius: '50%',
+                      backgroundColor: (() => {
+                        if (currentSession.status !== 'active') return '#999';
+                        // 最近5分钟内有访客活动才显示在线绿点
+                        // 只使用 lastVisitorActivityAt（仅访客发消息时更新），
+                        // 不再使用 lastMessageAt（客服回复也会更新，导致误判）
+                        const threshold = 5 * 60 * 1000;
+                        if (currentSession.lastVisitorActivityAt) {
+                          return Date.now() - new Date(currentSession.lastVisitorActivityAt).getTime() < threshold ? '#52c41a' : '#999';
+                        }
+                        return '#999';
+                      })(),
+                    }}></span>
+                    {currentSession.visitorName}
+                  </div>
+                  {currentSession.ip && (
+                    <div style={{ fontSize: '11px', color: '#999', marginTop: '4px', paddingLeft: '16px' }}>
+                      🌐 {currentSession.ip}
+                    </div>
+                  )}
+                </div>
+                <div style={{ flex: 1, overflow: 'auto' }}>
+                  <VisitorInfoPanel
+                    session={currentSession}
+                    fieldDefs={visitorFieldDefs}
+                  />
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Staff management page */}
+        {currentPage === 'staff' && (
+          <div style={{ flex: 1, overflow: 'hidden' }}>
+            <StaffManagement />
+          </div>
+        )}
+
+        {/* Code page */}
+        {currentPage === 'code' && (
+          <div style={{ flex: 1, overflow: 'hidden' }}>
+            <StaffCode />
+          </div>
+        )}
+
+        {/* Visitor Fields page */}
+        {currentPage === 'visitorFields' && (
+          <div style={{ flex: 1, overflow: 'hidden' }}>
+            <VisitorFields />
+          </div>
+        )}
+
+        {/* Settings page */}
+        {currentPage === 'settings' && (
+          <div style={{ flex: 1, overflow: 'hidden' }}>
+            <StaffSettings />
+          </div>
+        )}
+      </div>
+
+      {/* Floating button (mobile only) */}
+      {isMobile && (
+        <button
+          style={floatingButtonStyle}
+          onClick={toggleSessionList}
+          title={t('staff_session_list')}
+        >
+          <MessageCircle size={24} />
+          {totalUnread > 0 && (
+            <span
+              style={{
+                position: 'absolute',
+                top: '-4px',
+                right: '-4px',
+                backgroundColor: '#ff4d4f',
+                color: '#fff',
+                fontSize: '12px',
+                minWidth: '20px',
+                height: '20px',
+                borderRadius: '10px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '0 4px',
+              }}
+            >
+              {totalUnread > 99 ? '99+' : totalUnread}
+            </span>
+          )}
+        </button>
+      )}
+
+      {/* Profile Edit Modal */}
+      {showProfileModal && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(0,0,0,0.5)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onClick={() => handleCloseProfile()}
+        >
+          <div
+            style={{
+              backgroundColor: '#fff',
+              borderRadius: '8px',
+              padding: '24px',
+              width: '90%',
+              maxWidth: '400px',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ margin: '0 0 20px 0', fontSize: '16px', fontWeight: 'bold' }}>
+              {t('staff_nav_profile')}
+            </h3>
+            {profileMessage && (
+              <div
+                style={{
+                  padding: '8px 12px',
+                  marginBottom: '16px',
+                  borderRadius: '4px',
+                  backgroundColor: profileMessage.includes(t('success')) ? '#f6ffed' : '#fff2f0',
+                  color: profileMessage.includes(t('success')) ? '#52c41a' : '#ff4d4f',
+                  fontSize: '13px',
+                }}
+              >
+                {profileMessage}
+              </div>
+            )}
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ display: 'block', marginBottom: '6px', fontSize: '13px', color: '#666' }}>
+                {t('staff_profile_name')}
+              </label>
+              <input
+                type="text"
+                value={profileForm.name}
+                onChange={(e) => setProfileForm({ ...profileForm, name: e.target.value })}
+                placeholder={t('staff_profile_name_placeholder')}
+                style={{
+                  width: '100%',
+                  padding: '8px 12px',
+                  border: '1px solid #d9d9d9',
+                  borderRadius: '4px',
+                  fontSize: '13px',
+                  boxSizing: 'border-box',
+                }}
+              />
+            </div>
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ display: 'block', marginBottom: '6px', fontSize: '13px', color: '#666' }}>
+                {t('staff_profile_new_password')}
+              </label>
+              <input
+                type="password"
+                value={profileForm.password}
+                onChange={(e) => setProfileForm({ ...profileForm, password: e.target.value })}
+                placeholder={t('staff_profile_password_placeholder')}
+                style={{
+                  width: '100%',
+                  padding: '8px 12px',
+                  border: '1px solid #d9d9d9',
+                  borderRadius: '4px',
+                  fontSize: '13px',
+                  boxSizing: 'border-box',
+                }}
+              />
+            </div>
+            <div style={{ marginBottom: '20px' }}>
+              <label style={{ display: 'block', marginBottom: '6px', fontSize: '13px', color: '#666' }}>
+                {t('confirm_password')}
+              </label>
+              <input
+                type="password"
+                value={profileForm.confirmPassword}
+                onChange={(e) => setProfileForm({ ...profileForm, confirmPassword: e.target.value })}
+                placeholder={t('confirm_password_hint')}
+                style={{
+                  width: '100%',
+                  padding: '8px 12px',
+                  border: '1px solid #d9d9d9',
+                  borderRadius: '4px',
+                  fontSize: '13px',
+                  boxSizing: 'border-box',
+                }}
+              />
+            </div>
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+              <button
+                onClick={handleCloseProfile}
+                style={{
+                  padding: '8px 16px',
+                  border: '1px solid #d9d9d9',
+                  borderRadius: '4px',
+                  backgroundColor: '#fff',
+                  cursor: 'pointer',
+                  fontSize: '13px',
+                  color: '#666',
+                }}
+              >
+              {t('cancel')}
+              </button>
+              <button
+                onClick={handleUpdateProfile}
+                style={{
+                  padding: '8px 16px',
+                  border: 'none',
+                  borderRadius: '4px',
+                  backgroundColor: '#1890ff',
+                  cursor: 'pointer',
+                  fontSize: '13px',
+                  color: '#fff',
+                }}
+              >
+                {t('staff_profile_save')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Queue List Modal */}
+      <QueueList
+        isOpen={showQueueList}
+        onClose={() => setShowQueueList(false)}
+        onSelectSession={handleSelectSession}
+        t={t as any}
+      />
+
+      {/* Transfer Request Notification Panel */}
+      {showTransferNotification && pendingTransfers.length > 0 && (
+        <div
+          style={{
+            position: 'fixed',
+            top: '70px',
+            right: '20px',
+            width: '350px',
+            backgroundColor: '#fff',
+            borderRadius: '8px',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.15)',
+            zIndex: 1000,
+            maxHeight: '400px',
+            overflow: 'hidden',
+          }}
+        >
+          <div
+            style={{
+              padding: '12px 16px',
+              borderBottom: '1px solid #f0f0f0',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              backgroundColor: '#faad14',
+              color: '#fff',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <ArrowRightLeft size={16} />
+              <span style={{ fontWeight: 500 }}>{t('staff_transfer_pending')} ({pendingTransfers.length})</span>
+            </div>
+            <button
+              onClick={() => setShowTransferNotification(false)}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#fff',
+                cursor: 'pointer',
+                fontSize: '18px',
+                padding: '0',
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+          </div>
+          <div style={{ overflowY: 'auto', maxHeight: '340px' }}>
+            {pendingTransfers.map((request) => (
+              <div
+                key={request.id}
+                style={{
+                  padding: '12px 16px',
+                  borderBottom: '1px solid #f0f0f0',
+                }}
+              >
+                <div style={{ marginBottom: '8px' }}>
+                  <div style={{ fontSize: '14px', fontWeight: 500, color: '#333' }}>
+                    {t('staff_transfer_from')}{request.from_staff_name || request.from_staff_id}
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#999', marginTop: '4px' }}>
+                    {t('staff_transfer_session')}{request.session_visitor_name || request.session_id}
+                  </div>
+                  {request.reason && (
+                    <div style={{ fontSize: '12px', color: '#666', marginTop: '4px' }}>
+                      {t('staff_transfer_reason')}{request.reason}
+                    </div>
+                  )}
+                  <div style={{ fontSize: '11px', color: '#bbb', marginTop: '4px' }}>
+                    {new Date(request.created_at).toLocaleString(navigator.language || 'en')}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button
+                    onClick={() => handleAcceptTransfer(request.id)}
+                    style={{
+                      flex: 1,
+                      padding: '6px 12px',
+                      backgroundColor: '#52c41a',
+                      border: 'none',
+                      borderRadius: '4px',
+                      color: '#fff',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    {t('staff_transfer_accept')}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSelectedRejectRequest(request);
+                      setShowTransferNotification(true);
+                    }}
+                    style={{
+                      flex: 1,
+                      padding: '6px 12px',
+                      backgroundColor: '#ff4d4f',
+                      border: 'none',
+                      borderRadius: '4px',
+                      color: '#fff',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    {t('staff_transfer_reject')}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Rejected Transfers Notification */}
+      {showRejectionNotification && rejectedTransfers.length > 0 && (
+        <div
+          style={{
+            position: 'fixed',
+            top: '60px',
+            right: '20px',
+            width: '320px',
+            backgroundColor: '#fff',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+            zIndex: 1000,
+            maxHeight: '400px',
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          <div
+            style={{
+              padding: '12px 16px',
+              borderBottom: '1px solid #f0f0f0',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              backgroundColor: '#ff4d4f',
+              color: '#fff',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <XCircle size={16} />
+              <span style={{ fontWeight: 500 }}>{t('staff_transfer_rejected')} ({rejectedTransfers.length})</span>
+            </div>
+            <button
+              onClick={() => setShowRejectionNotification(false)}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#fff',
+                cursor: 'pointer',
+                fontSize: '18px',
+                padding: '0',
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+          </div>
+          <div style={{ overflowY: 'auto', maxHeight: '340px' }}>
+            {rejectedTransfers.slice(0, 5).map((request) => (
+              <div
+                key={request.id}
+                style={{
+                  padding: '12px 16px',
+                  borderBottom: '1px solid #f0f0f0',
+                }}
+              >
+                <div style={{ marginBottom: '8px' }}>
+                  <div style={{ fontSize: '14px', fontWeight: 500, color: '#333' }}>
+                    {t('staff_transfer_rejected_by')} {request.to_staff_name || request.to_staff_id} {t('rejected')}
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#999', marginTop: '4px' }}>
+                    {t('staff_transfer_session')}{request.session_visitor_name || request.session_id}
+                  </div>
+                  {request.reject_reason && (
+                    <div style={{ fontSize: '12px', color: '#ff4d4f', marginTop: '4px', padding: '8px', backgroundColor: '#fff1f0', borderRadius: '4px' }}>
+                      {t('reject_reason_prefix')}{request.reject_reason}
+                    </div>
+                  )}
+                  <div style={{ fontSize: '11px', color: '#bbb', marginTop: '4px' }}>
+                    {new Date(request.created_at).toLocaleString(navigator.language || 'en')}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+                  <button
+                    onClick={() => {
+                      setSelectedReapplyRequest(request);
+                      setReapplyReason(request.reason || ''); // Pre-fill with original reason
+                    }}
+                    style={{
+                      flex: 1,
+                      padding: '6px 12px',
+                      backgroundColor: '#1890ff',
+                      border: 'none',
+                      borderRadius: '4px',
+                      color: '#fff',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    {t('staff_transfer_continue')}
+                  </button>
+                  <button
+                    onClick={() => handleCancelRejection(request.id)}
+                    style={{
+                      flex: 1,
+                      padding: '6px 12px',
+                      backgroundColor: '#d9d9d9',
+                      border: 'none',
+                      borderRadius: '4px',
+                      color: '#666',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    {t('cancel')}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Reject Reason Modal */}
+      {selectedRejectRequest && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0,0,0,0.5)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1001,
+          }}
+          onClick={() => {
+            setSelectedRejectRequest(null);
+            setRejectReason('');
+          }}
+        >
+          <div
+            style={{
+              backgroundColor: '#fff',
+              borderRadius: '8px',
+              padding: '24px',
+              width: '90%',
+              maxWidth: '400px',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ margin: '0 0 16px 0', fontSize: '16px', fontWeight: 'bold' }}>
+              {t('staff_transfer_reject_title')}
+            </h3>
+            <div style={{ marginBottom: '16px', fontSize: '14px', color: '#666' }}>
+              {t('staff_transfer_reject_desc')} <strong>{selectedRejectRequest.from_staff_name || selectedRejectRequest.from_staff_id}</strong> {t('rejecting_transfer_from')}
+            </div>
+            <textarea
+              value={rejectReason}
+              onChange={(e) => setRejectReason(e.target.value)}
+              placeholder={t('staff_transfer_reject_placeholder')}
+              rows={4}
+              style={{
+                width: '100%',
+                padding: '12px',
+                border: '1px solid #d9d9d9',
+                borderRadius: '4px',
+                fontSize: '14px',
+                resize: 'vertical',
+                boxSizing: 'border-box',
+                marginBottom: '16px',
+              }}
+            />
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => {
+                  setSelectedRejectRequest(null);
+                  setRejectReason('');
+                }}
+                style={{
+                  padding: '8px 16px',
+                  border: '1px solid #d9d9d9',
+                  borderRadius: '4px',
+                  backgroundColor: '#fff',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  color: '#666',
+                }}
+              >
+                {t('cancel')}
+              </button>
+              <button
+                onClick={handleRejectTransfer}
+                disabled={!rejectReason.trim()}
+                style={{
+                  padding: '8px 16px',
+                  border: 'none',
+                  borderRadius: '4px',
+                  backgroundColor: rejectReason.trim() ? '#ff4d4f' : '#d9d9d9',
+                  cursor: rejectReason.trim() ? 'pointer' : 'not-allowed',
+                  fontSize: '14px',
+                  color: '#fff',
+                }}
+              >
+                {t('staff_transfer_confirm_reject')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Re-apply Transfer Modal */}
+      {selectedReapplyRequest && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0,0,0,0.5)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1001,
+          }}
+          onClick={() => {
+            setSelectedReapplyRequest(null);
+            setReapplyReason('');
+          }}
+        >
+          <div
+            style={{
+              backgroundColor: '#fff',
+              borderRadius: '8px',
+              padding: '24px',
+              width: '90%',
+              maxWidth: '400px',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ margin: '0 0 16px 0', fontSize: '16px', fontWeight: 'bold' }}>
+              {t('staff_transfer_resend_title')}
+            </h3>
+            <div style={{ marginBottom: '16px', fontSize: '14px', color: '#666' }}>
+              {t('staff_transfer_resend_desc')} <strong>{selectedReapplyRequest.to_staff_name || selectedReapplyRequest.to_staff_id}</strong> {t('staff_transfer_resend_desc_apply')}
+            </div>
+            <div style={{ marginBottom: '16px', fontSize: '12px', color: '#999' }}>
+              {t('staff_transfer_session')} {selectedReapplyRequest.session_visitor_name || selectedReapplyRequest.session_id}
+            </div>
+            <textarea
+              value={reapplyReason}
+              onChange={(e) => setReapplyReason(e.target.value)}
+              placeholder={t('staff_transfer_reason_placeholder')}
+              rows={4}
+              style={{
+                width: '100%',
+                padding: '12px',
+                border: '1px solid #d9d9d9',
+                borderRadius: '4px',
+                fontSize: '14px',
+                resize: 'vertical',
+                boxSizing: 'border-box',
+                marginBottom: '16px',
+              }}
+            />
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => {
+                  setSelectedReapplyRequest(null);
+                  setReapplyReason('');
+                }}
+                style={{
+                  padding: '8px 16px',
+                  border: '1px solid #d9d9d9',
+                  borderRadius: '4px',
+                  backgroundColor: '#fff',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  color: '#666',
+                }}
+              >
+                {t('cancel')}
+              </button>
+              <button
+                onClick={handleReapplyTransfer}
+                disabled={!reapplyReason.trim()}
+                style={{
+                  padding: '8px 16px',
+                  border: 'none',
+                  borderRadius: '4px',
+                  backgroundColor: reapplyReason.trim() ? '#1890ff' : '#d9d9d9',
+                  cursor: reapplyReason.trim() ? 'pointer' : 'not-allowed',
+                  fontSize: '14px',
+                  color: '#fff',
+                }}
+              >
+                {t('staff_transfer_send')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

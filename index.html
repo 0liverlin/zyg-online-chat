@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/icons/icon-192.svg" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#1890ff" />
+    <meta name="description" content="CF智能多语言在线客服系统 - 基于Cloudflare Workers的免费多语言实时客服平台" />
+    <link rel="manifest" href="/manifest.json" />
+    <title>CF智能多语言在线客服系统</title>
+    <!-- PWA: iOS Safari 支持 -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="智能客服" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.svg" />
+    <link rel="apple-touch-startup-image" href="/icons/icon-512.svg" />
+    <!-- PWA: Windows / Edge 支持 -->
+    <meta name="msapplication-TileColor" content="#1890ff" />
+    <meta name="msapplication-tap-highlight" content="no" />
+    <!-- PWA: 全平台颜色方案 -->
+    <meta name="color-scheme" content="light dark" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/client/main.tsx"></script>
+    <script>
+      // ★ 注册 Service Worker（全浏览器：Chrome/Firefox/Edge/Safari/Opera/Samsung）
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js', { scope: '/' })
+            .then((registration) => {
+              console.log('[PWA] SW registered:', registration.scope);
+              // 自动检查并应用更新
+              registration.addEventListener('updatefound', () => {
+                const newWorker = registration.installing;
+                if (newWorker) {
+                  newWorker.addEventListener('statechange', () => {
+                    if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                      console.log('[PWA] New version available, will update on next load');
+                    }
+                  });
+                }
+              });
+            })
+            .catch((error) => {
+              console.log('[PWA] SW registration failed:', error);
+            });
+        });
+      }
+
+      // ★ PWA 安装事件（Firefox/Edge/Chrome/Opera 均支持）
+      let deferredPrompt = null;
+      window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        deferredPrompt = e;
+        // 标记可用于 PWAInstallPrompt 组件
+        window.__pwa_deferredPrompt = deferredPrompt;
+      });
+
+      // ★ 音频上下文预解锁（需在首次用户交互时初始化）
+      //   创建并保持 AudioContext 存活，供 notificationSound.ts 复用
+      //   Chrome: 用户手势后 resume() 即可
+      //   Safari: 必须在用户手势同步回调中创建并 resume
+      //   Firefox: 类似 Chrome，但需要 await resume()
+      window.__audio_unlocked = false;
+      window.__shared_audio_ctx = null;
+      async function unlockAudioNow() {
+        if (window.__audio_unlocked) return;
+        try {
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          if (!AudioCtx) return;
+          const ctx = new AudioCtx();
+          // ★ Safari/跨浏览器：必须 await resume()
+          if (ctx.state === 'suspended') {
+            await ctx.resume();
+          }
+          // 播放极短静音缓冲区彻底激活 AudioContext
+          if (ctx.state === 'running') {
+            const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
+            const src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(ctx.destination);
+            src.start(0);
+            src.stop(ctx.currentTime + 0.001);
+          }
+          window.__shared_audio_ctx = ctx; // ★ 保持存活，供 notificationSound 复用
+          window.__audio_unlocked = true;
+          console.log('[PWA] Audio unlocked, state:', ctx.state);
+        } catch (e) {
+          console.warn('[PWA] Audio unlock failed:', e);
+        }
+      }
+      // ★ 使用 { once: true } 避免重复监听
+      const unlockHandler = () => { unlockAudioNow(); };
+      document.addEventListener('click', unlockHandler, { once: true, capture: true });
+      document.addEventListener('touchstart', unlockHandler, { once: true, capture: true });
+      document.addEventListener('keydown', unlockHandler, { once: true, capture: true });
+    </script>
+  </body>
+</html>

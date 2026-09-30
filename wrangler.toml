@@ -1,0 +1,49 @@
+name = "zyg-online-chat"
+main = "src/server/index.worker.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+# Environment variables
+[vars]
+BARK_API = "https://api.day.app"
+# Auth: Require login for staff panel
+REQUIRE_AUTH = "true"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "zyg-online-chat-db"
+database_id = "9f0c5be9-78de-47f9-8784-ade1361a75ee"
+
+# R2 bucket for file uploads
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "zyg-online-chat-uploads"
+
+[build]
+command = "npm run build:worker"
+
+[env.production]
+name = "zyg-online-chat"
+
+[env.production.vars]
+BARK_API = "https://api.day.app"
+REQUIRE_AUTH = "true"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "zyg-online-chat-db"
+database_id = "91fad6d8-e535-4bc0-95fc-2b69c32c7d22"
+
+[ai]
+binding = "AI"
+
+[[env.production.r2_buckets]]
+binding = "BUCKET"
+bucket_name = "zyg-online-chat-uploads"
+
+[env.production.ai]
+binding = "AI"
